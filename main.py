@@ -19,12 +19,14 @@ class Main(Star):
     """
     炉石传说国服排行榜查询插件。
 
-    v1.7.0：
+    v1.7.2：
     - 战棋榜 最强/最菜 改为涨跌榜，不再是当前榜单前后名。
     - 战棋榜 双打排行 / 战棋榜 单打排行：当前排行榜，默认 20 行，可加数字。
     - 查人精确命中时显示排名上下文；例如第 500 名显示 450-500 区间。
     - 仍支持无斜杠中文入口：战棋榜 XX。
     - 新增后台自动记录：启动后每天固定时间自动刷新并记录排行榜。
+    - 修复 /hsrank 等命令同时被 command 和 regex 命中导致重复回复的问题。
+    - 默认查人时只显示命中的模式：只有双打显示双打，只有单打显示单打，双打单打都有才显示两个。
     """
 
     CN_API = "https://webapi.blizzard.cn/hs-rank-api-server/api/game/ranks"
@@ -76,9 +78,9 @@ class Main(Star):
         async for result in self._handle_rank_command(event):
             yield result
 
-    @filter.regex(r"^\s*(?:战棋榜|炉石榜|炉石排行|hsrank)(?:\s+.*)?\s*$")
+    @filter.regex(r"^\s*战棋榜(?:\s+.*)?\s*$")
     async def battle_rank_text_command(self, event: AstrMessageEvent):
-        # 支持群里直接发送：战棋榜 Scoy、战棋榜 涨跌 Scoy。
+        # 支持群里直接发送：战棋榜 Scoy、战棋榜 涨跌 Scoy。不要在这里匹配 hsrank，避免和 @filter.command 重复触发。
         async for result in self._handle_rank_command(event):
             yield result
 
@@ -717,44 +719,75 @@ class Main(Star):
         )
 
     async def _format_search_both(self, keyword: str, exact: bool, limit: int) -> str:
+        """
+        默认查人逻辑：
+        - 后台同时查双打和单打。
+        - 哪个模式有结果就显示哪个模式。
+        - 只有双打命中：只显示双打。
+        - 只有单打命中：只显示单打。
+        - 双打和单打都命中：两个都显示。
+        - 两边都没命中：合并提示未找到。
+        """
         sections = []
         total = 0
+        hit_modes = []
 
         for mode in self.MODES:
             data = await self._get_leaderboard(mode)
+
             if exact:
                 rows = [
-                    row for row in data["rows"]
+                    row for row in data.get("official_rows", [])
                     if row["name"].lower() == keyword.lower()
                 ]
-                total += len(rows)
-                sections.append(
-                    self._format_exact_context(
-                        mode=mode,
-                        nickname=keyword,
-                        data=data,
-                        context_before=self._context_before(),
+
+                fake = self._find_fake_by_name(mode, keyword)
+
+                if rows or fake:
+                    total += len(rows) + (1 if fake and not rows else 0)
+                    hit_modes.append(self.MODE_NAMES[mode])
+                    sections.append(
+                        self._format_exact_context(
+                            mode=mode,
+                            nickname=keyword,
+                            data=data,
+                            context_before=self._context_before(),
+                        )
                     )
-                )
             else:
                 rows = [
                     row for row in data["rows"]
                     if keyword.lower() in row["name"].lower()
                 ]
-                suffix = f"昵称含有'{keyword}'的名单"
-                total += len(rows)
-                sections.append(
-                    self._format_rows(
-                        mode=mode,
-                        rows=rows[:limit],
-                        data=data,
-                        title_suffix=suffix,
-                        total_count=len(rows),
-                        limit=limit,
-                    )
-                )
 
-        header = f"已同时查询【战棋双打】和【酒馆战棋单打】，共命中 {total} 条。"
+                if rows:
+                    total += len(rows)
+                    hit_modes.append(self.MODE_NAMES[mode])
+                    suffix = f"昵称含有'{keyword}'的名单"
+                    sections.append(
+                        self._format_rows(
+                            mode=mode,
+                            rows=rows[:limit],
+                            data=data,
+                            title_suffix=suffix,
+                            total_count=len(rows),
+                            limit=limit,
+                        )
+                    )
+
+        if not sections:
+            mode_names = "、".join(self.MODE_NAMES[m] for m in self.MODES)
+            search_type = "精确昵称" if exact else "昵称关键词"
+            return (
+                f"已同时查询【{mode_names}】，没有找到{search_type}“{keyword}”。\n"
+                f"可以试试：战棋榜 查 {keyword} 或确认大小写/昵称是否一致。"
+            )
+
+        if len(hit_modes) == 1:
+            header = f"已查询双打和单打，仅【{hit_modes[0]}】命中，共 {total} 条。"
+        else:
+            header = f"已查询双打和单打，【{'、'.join(hit_modes)}】均命中，共 {total} 条。"
+
         return header + "\n\n" + "\n\n".join(sections)
 
     async def _format_top_both(self, limit: int) -> str:
@@ -1543,9 +1576,9 @@ class Main(Star):
     def _help_text(self) -> str:
         return (
             "炉石战棋榜查询用法：\n"
-            "战棋榜 Scoy                    同时模糊查询双打+单打昵称\n"
-            "战棋榜 id Scoy                 同时精确查双打+单打，并显示排名区间\n"
-            "战棋榜 查 Scoy                 同时模糊查询双打+单打昵称\n"
+            "战棋榜 Scoy                    默认查人：只显示命中的双打/单打模式\n"
+            "战棋榜 id Scoy                 精确查人：命中哪个模式就显示哪个\n"
+            "战棋榜 查 Scoy                 模糊查人：命中哪个模式就显示哪个\n"
             "战棋榜 涨跌 Scoy               同时查询双打+单打个人涨跌\n"
             "战棋榜 更新                    同时刷新并记录双打+单打榜单\n"
             "战棋榜 设置                    查看后台配置说明\n"
