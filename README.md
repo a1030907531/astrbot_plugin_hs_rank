@@ -1,10 +1,13 @@
 # astrbot_plugin_hs_rank
 
-作者：Scoy
-
 炉石传说国服战棋排行榜查询插件。
 
-## v1.7.2 变更
+## v1.7.3 变更
+
+
+- 数据文件迁移到 `AstrBot/data/plugin_data/astrbot_plugin_hs_rank/`，避免污染 `/AstrBot/data` 根目录。
+- 首次启动会自动把旧的 `/AstrBot/data/plugin_data/astrbot_plugin_hs_rank/hsrank_state.json` 复制迁移到新目录。
+- 历史记录、手动榜、后续卡牌缓存都建议放在这个插件数据目录。
 
 - 修复 `/hsrank`、`/炉石榜`、`/炉石排行` 这类 command 入口和 regex 入口重复命中导致重复回复的问题。
 - 现在无斜杠中文入口只保留 `战棋榜 XX`。
@@ -17,10 +20,10 @@
 ## 主要命令
 
 ```text
-战棋榜 Scoy
-战棋榜 id Scoy
-战棋榜 查 Scoy
-战棋榜 涨跌 Scoy
+战棋榜 某人
+战棋榜 id 某人
+战棋榜 查 关键词
+战棋榜 涨跌 某人
 战棋榜 更新
 ```
 
@@ -75,7 +78,7 @@ auto_snapshot_jitter_minutes: 5
 历史记录默认在：
 
 ```text
-/AstrBot/data/hsrank_state.json
+/AstrBot/data/plugin_data/astrbot_plugin_hs_rank/hsrank_state.json
 ```
 
 只要你不是删除这个文件，或者清空整个 `/AstrBot/data`，涨跌历史就会保留。

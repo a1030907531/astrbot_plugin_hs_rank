@@ -66,8 +66,8 @@
   "state_file_path": {
     "description": "历史记录/手动榜保存路径",
     "type": "string",
-    "default": "/AstrBot/data/hsrank_state.json",
-    "hint": "建议不要放插件目录里。删除插件目录不会丢历史，删除这个文件才会丢。"
+    "default": "/AstrBot/data/plugin_data/astrbot_plugin_hs_rank/hsrank_state.json",
+    "hint": "建议保持默认。状态文件、历史记录、后续卡牌缓存等统一放在 plugin_data 插件数据目录，便于清理。"
   },
   "context_before": {
     "description": "精确查人时显示其前面多少名",

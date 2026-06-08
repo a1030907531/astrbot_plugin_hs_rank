@@ -2,6 +2,7 @@ import asyncio
 import json
 import math
 import random
+import shutil
 import shlex
 import time
 from datetime import datetime, timedelta
@@ -19,7 +20,7 @@ class Main(Star):
     """
     炉石传说国服排行榜查询插件。
 
-    v1.7.2：
+    v1.7.3：
     - 战棋榜 最强/最菜 改为涨跌榜，不再是当前榜单前后名。
     - 战棋榜 双打排行 / 战棋榜 单打排行：当前排行榜，默认 20 行，可加数字。
     - 查人精确命中时显示排名上下文；例如第 500 名显示 450-500 区间。
@@ -27,6 +28,7 @@ class Main(Star):
     - 新增后台自动记录：启动后每天固定时间自动刷新并记录排行榜。
     - 修复 /hsrank 等命令同时被 command 和 regex 命中导致重复回复的问题。
     - 默认查人时只显示命中的模式：只有双打显示双打，只有单打显示单打，双打单打都有才显示两个。
+    - 数据文件迁移到 AstrBot/data/plugin_data/astrbot_plugin_hs_rank/，并自动兼容旧路径。
     """
 
     CN_API = "https://webapi.blizzard.cn/hs-rank-api-server/api/game/ranks"
@@ -80,7 +82,7 @@ class Main(Star):
 
     @filter.regex(r"^\s*战棋榜(?:\s+.*)?\s*$")
     async def battle_rank_text_command(self, event: AstrMessageEvent):
-        # 支持群里直接发送：战棋榜 Scoy、战棋榜 涨跌 Scoy。不要在这里匹配 hsrank，避免和 @filter.command 重复触发。
+        # 支持群里直接发送：战棋榜 某人、战棋榜 涨跌 某人。不要在这里匹配 hsrank，避免和 @filter.command 重复触发。
         async for result in self._handle_rank_command(event):
             yield result
 
@@ -397,7 +399,7 @@ class Main(Star):
             if cmd in {"id", "查id", "查询id", "昵称"}:
                 mode, rest, has_mode = self._parse_optional_mode(tokens[1:])
                 if not rest:
-                    yield event.plain_result("请提供要查询的昵称，例如：战棋榜 id Scoy 或 战棋榜 Scoy")
+                    yield event.plain_result("请提供要查询的昵称，例如：战棋榜 id 某人 或 战棋榜 某人")
                     return
 
                 nickname = " ".join(rest).strip()
@@ -418,7 +420,7 @@ class Main(Star):
             if cmd in {"find", "search", "查", "搜索"}:
                 mode, rest, has_mode = self._parse_optional_mode(tokens[1:])
                 if not rest:
-                    yield event.plain_result("请提供关键词，例如：战棋榜 查 Scoy 或 战棋榜 Scoy")
+                    yield event.plain_result("请提供关键词，例如：战棋榜 查 关键词 或 战棋榜 某人")
                     return
 
                 keyword = rest[0]
@@ -484,7 +486,7 @@ class Main(Star):
                 )
                 return
 
-            # 简化：/hsrank Scoy 直接当作双打+单打模糊查人。
+            # 简化：/hsrank 某人 直接当作双打+单打模糊查人。
             keyword = " ".join(tokens).strip()
             if keyword:
                 yield event.plain_result(await self._format_search_both(keyword, exact=False, limit=self._default_query_limit()))
@@ -577,7 +579,7 @@ class Main(Star):
             "5. 是否只有管理员能改手动榜 require_admin_for_fake_ops\n"
             "6. 管理员 QQ/用户ID 列表 admin_ids\n"
             "7. 历史记录文件路径 state_file_path\n"
-            "普通查询不需要管理员：战棋榜 Scoy / 战棋榜 涨跌 Scoy"
+            "普通查询不需要管理员：战棋榜 某人 / 战棋榜 涨跌 某人"
         )
 
     async def _refresh_modes(self, modes: list[str]) -> str:
@@ -597,8 +599,8 @@ class Main(Star):
         if not rest:
             yield event.plain_result(
                 "格式：战棋榜 涨跌 昵称\n"
-                "例：战棋榜 涨跌 Scoy\n"
-                "也可以指定单模式：战棋榜 涨跌 duo Scoy 或 战棋榜 涨跌 bg Scoy"
+                "例：战棋榜 涨跌 某人\n"
+                "也可以指定单模式：战棋榜 涨跌 duo 某人 或 战棋榜 涨跌 bg 某人"
             )
             return
 
@@ -824,22 +826,63 @@ class Main(Star):
             )
         return "\n\n".join(sections)
 
-    def _find_state_file_path(self) -> Path:
-        configured_path = self._config_str("state_file_path", "/AstrBot/data/hsrank_state.json")
+    def _plugin_data_dir(self) -> Path:
+        """
+        插件数据目录。
+        按 AstrBot 建议，状态文件、历史记录、后续卡牌缓存等都放在：
+        /AstrBot/data/plugin_data/astrbot_plugin_hs_rank/
+        避免污染 /AstrBot/data 根目录。
+        """
         candidates = [
-            Path(configured_path),
-            Path("/AstrBot/data/hsrank_state.json"),
-            Path.cwd() / "data" / "hsrank_state.json",
+            Path("/AstrBot/data/plugin_data/astrbot_plugin_hs_rank"),
+            Path.cwd() / "data" / "plugin_data" / "astrbot_plugin_hs_rank",
+            Path("data") / "plugin_data" / "astrbot_plugin_hs_rank",
         ]
 
         for path in candidates:
             try:
-                path.parent.mkdir(parents=True, exist_ok=True)
+                path.mkdir(parents=True, exist_ok=True)
                 return path
             except Exception:
                 continue
 
-        return Path("hsrank_state.json")
+        fallback = Path("astrbot_plugin_hs_rank_data")
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+    def _find_state_file_path(self) -> Path:
+        configured = self._config_str("state_file_path", "").strip()
+
+        # 如果用户后台显式配置了路径，尊重用户配置。
+        if configured:
+            try:
+                path = Path(configured)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                return path
+            except Exception as e:
+                logger.warning(f"state_file_path 配置无效，将使用默认插件数据目录：{configured}，原因：{e}")
+
+        new_path = self._plugin_data_dir() / "hsrank_state.json"
+
+        # 兼容旧版本：自动迁移旧状态文件。
+        old_paths = [
+            Path("/AstrBot/data/plugin_data/astrbot_plugin_hs_rank/hsrank_state.json"),
+            Path.cwd() / "data" / "hsrank_state.json",
+            Path("hsrank_state.json"),
+        ]
+
+        if not new_path.exists():
+            for old_path in old_paths:
+                try:
+                    if old_path.exists() and old_path.resolve() != new_path.resolve():
+                        new_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(old_path, new_path)
+                        logger.info(f"已迁移炉石战棋榜状态文件：{old_path} -> {new_path}")
+                        break
+                except Exception as e:
+                    logger.warning(f"迁移旧状态文件失败：{old_path} -> {new_path}，原因：{e}")
+
+        return new_path
 
     def _default_fake_entries(self) -> dict:
         return {
@@ -1575,40 +1618,50 @@ class Main(Star):
 
     def _help_text(self) -> str:
         return (
-            "炉石战棋榜查询用法：\n"
-            "战棋榜 Scoy                    默认查人：只显示命中的双打/单打模式\n"
-            "战棋榜 id Scoy                 精确查人：命中哪个模式就显示哪个\n"
-            "战棋榜 查 Scoy                 模糊查人：命中哪个模式就显示哪个\n"
-            "战棋榜 涨跌 Scoy               同时查询双打+单打个人涨跌\n"
-            "战棋榜 更新                    同时刷新并记录双打+单打榜单\n"
-            "战棋榜 设置                    查看后台配置说明\n"
+            "炉石战棋榜用法：\n"
+            "\n"
+            "查人：\n"
+            "战棋榜 某人                    按昵称关键词查询；命中双打/单打哪个就显示哪个\n"
+            "战棋榜 id 某人                 精确查询昵称；命中后显示所在排名区间\n"
+            "战棋榜 查 关键词               模糊查询昵称关键词\n"
+            "战棋榜 涨跌 某人               查询某人在双打和单打中的排名涨跌\n"
             "\n"
             "当前排行榜：\n"
-            "战棋榜 双打排行                默认显示双打前20名\n"
+            "战棋榜 双打排行                显示双打前20名\n"
             "战棋榜 双打排行 50             显示双打前50名\n"
-            "战棋榜 单打排行                默认显示单打前20名\n"
+            "战棋榜 单打排行                显示单打前20名\n"
             "战棋榜 单打排行 50             显示单打前50名\n"
             "\n"
             "涨跌榜：\n"
-            "战棋榜 最强                    双打+单打排名上升最多前N名\n"
-            "战棋榜 最强 20                 双打+单打排名上升最多前20名\n"
-            "战棋榜 最强 bg 20              单打排名上升最多前20名\n"
-            "战棋榜 最菜                    双打+单打排名下降最多前N名\n"
-            "战棋榜 最菜 bg 20              单打排名下降最多前20名\n"
+            "战棋榜 最强                    显示双打+单打排名上升最多的玩家\n"
+            "战棋榜 最强 20                 显示双打+单打排名上升最多前20名\n"
+            "战棋榜 最强 bg 20              只显示单打排名上升最多前20名\n"
+            "战棋榜 最菜                    显示双打+单打排名下降最多的玩家\n"
+            "战棋榜 最菜 20                 显示双打+单打排名下降最多前20名\n"
+            "战棋榜 最菜 bg 20              只显示单打排名下降最多前20名\n"
             "\n"
-            "仍可指定单模式：\n"
-            "战棋榜 duo S                   只查战棋双打\n"
-            "战棋榜 bg S                    只查酒馆战棋单打\n"
-            "战棋榜 id duo Scoy             只精确查双打\n"
-            "战棋榜 涨跌 bg Scoy            只查单打个人涨跌\n"
+            "单模式查询：\n"
+            "战棋榜 duo 关键词              只查双打昵称关键词\n"
+            "战棋榜 bg 关键词               只查单打昵称关键词\n"
+            "战棋榜 id duo 某人             只精确查询双打昵称\n"
+            "战棋榜 id bg 某人              只精确查询单打昵称\n"
+            "战棋榜 涨跌 duo 某人           只查某人的双打涨跌\n"
+            "战棋榜 涨跌 bg 某人            只查某人的单打涨跌\n"
             "\n"
-            "手动装逼榜：\n"
-            "战棋榜 add duo 昵称 排名 积分 [备注]\n"
-            "战棋榜 add bg 昵称 排名 积分 [备注]\n"
-            "战棋榜 fake [数量]             同时查看双打+单打手动榜\n"
-            "战棋榜 delfake duo 昵称\n"
+            "数据更新：\n"
+            "战棋榜 更新                    手动刷新并记录双打+单打榜单\n"
+            "战棋榜 更新 duo                只刷新并记录双打榜单\n"
+            "战棋榜 更新 bg                 只刷新并记录单打榜单\n"
             "\n"
-            "旧命令 /hsrank 仍可用。历史记录保存在后台配置的 state_file_path，默认 /AstrBot/data/hsrank_state.json。"
+            "手动榜：\n"
+            "战棋榜 add duo 昵称 排名 积分 [备注]    添加一条双打手动记录\n"
+            "战棋榜 add bg 昵称 排名 积分 [备注]     添加一条单打手动记录\n"
+            "战棋榜 fake [数量]                      查看手动榜\n"
+            "战棋榜 delfake duo 昵称                 删除双打手动记录\n"
+            "战棋榜 delfake bg 昵称                  删除单打手动记录\n"
+            "\n"
+            "其他：\n"
+            "战棋榜 设置                    查看后台配置说明"
         )
 
     async def terminate(self):
