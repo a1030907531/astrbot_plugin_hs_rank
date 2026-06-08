@@ -1,6 +1,5 @@
 # astrbot_plugin_hs_rank
 
-作者：Scoy
 
 炉石传说国服战棋排行榜查询插件。
 
