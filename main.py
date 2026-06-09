@@ -20,7 +20,7 @@ class Main(Star):
     """
     炉石传说国服排行榜查询插件。
 
-    v1.7.3：
+    v1.7.4：
     - 战棋榜 最强/最菜 改为涨跌榜，不再是当前榜单前后名。
     - 战棋榜 双打排行 / 战棋榜 单打排行：当前排行榜，默认 20 行，可加数字。
     - 查人精确命中时显示排名上下文；例如第 500 名显示 450-500 区间。
@@ -1119,6 +1119,8 @@ class Main(Star):
     def _format_trend_board(self, mode: str, want_best: bool, limit: int) -> str:
         """
         根据最近两次历史快照生成涨跌榜。
+        最强：排名上升最多优先；排名变化相同时，积分增加更多优先。
+        最菜：只统计仍在榜玩家的排名下降；掉出榜单玩家不参与排序，只在末尾 PS 提示。
         """
         history = self.state.setdefault("history", {}).setdefault(mode, {})
         dates = sorted([d for d in history.keys() if isinstance(history.get(d), dict)])
@@ -1135,10 +1137,15 @@ class Main(Star):
         latest_snapshot = history.get(latest_date, {})
 
         changes = []
+        dropped = []
+
+        # 仍在榜玩家：比较排名与积分变化。
         for key, latest in latest_snapshot.items():
             prev = prev_snapshot.get(key)
             if not prev:
+                # 新进榜玩家没有上一期排名，不进入涨跌榜统计。
                 continue
+
             try:
                 prev_rank = int(prev.get("rank"))
                 latest_rank = int(latest.get("rank"))
@@ -1147,7 +1154,7 @@ class Main(Star):
             except Exception:
                 continue
 
-            rank_delta = prev_rank - latest_rank  # 正数=上升，负数=下降
+            rank_delta = prev_rank - latest_rank  # 正数=排名上升，负数=排名下降
             score_delta = latest_score - prev_score
 
             changes.append({
@@ -1160,41 +1167,73 @@ class Main(Star):
                 "score_delta": score_delta,
             })
 
-        if not changes:
+        # 上期有、这期没有：掉出榜单，不进入最菜榜排序，只在末尾 PS。
+        for key, prev in prev_snapshot.items():
+            if key in latest_snapshot:
+                continue
+
+            try:
+                prev_rank = int(prev.get("rank"))
+                prev_score = int(prev.get("score", 0))
+            except Exception:
+                continue
+
+            dropped.append({
+                "name": prev.get("name") or key,
+                "prev_rank": prev_rank,
+                "prev_score": prev_score,
+            })
+
+        if not changes and not dropped:
             return (
                 f"【{self.MODE_NAMES[mode]}】{'最强涨幅榜' if want_best else '最菜跌幅榜'}：\n"
                 f"{prev_date} -> {latest_date} 没有找到可对比的同名玩家。"
             )
 
         if want_best:
-            # 上升最多优先，其次分数增加多。
-            changes.sort(key=lambda x: (x["rank_delta"], x["score_delta"]), reverse=True)
+            candidates = list(changes)
+            candidates.sort(key=lambda x: (x["rank_delta"], x["score_delta"]), reverse=True)
             title = f"最强涨幅榜前{limit}名"
         else:
-            # 下降最多优先：rank_delta 越小越菜。
-            changes.sort(key=lambda x: (x["rank_delta"], x["score_delta"]))
+            # 最菜榜不统计掉出榜单，只统计仍在榜的下降/变化。
+            candidates = list(changes)
+            candidates.sort(key=lambda x: (x["rank_delta"], x["score_delta"]))
             title = f"最菜跌幅榜前{limit}名"
 
-        chosen = changes[:limit]
+        chosen = candidates[:limit]
         lines = [f"【{self.MODE_NAMES[mode]}】{title}（{prev_date} -> {latest_date}）："]
 
-        for item in chosen:
-            if item["rank_delta"] > 0:
-                rank_text = f"上升{item['rank_delta']}名"
-            elif item["rank_delta"] < 0:
-                rank_text = f"下降{abs(item['rank_delta'])}名"
-            else:
-                rank_text = "排名不变"
+        if chosen:
+            for idx, item in enumerate(chosen, 1):
+                if item["rank_delta"] > 0:
+                    rank_text = f"上升 {item['rank_delta']} 名"
+                elif item["rank_delta"] < 0:
+                    rank_text = f"下降 {abs(item['rank_delta'])} 名"
+                else:
+                    rank_text = "排名不变"
 
-            score_text = f"+{item['score_delta']}" if item["score_delta"] >= 0 else str(item["score_delta"])
-            lines.append(
-                f"{item['name']}：{item['prev_rank']} -> {item['latest_rank']}，{rank_text}，积分{score_text}"
-            )
+                score_text = f"+{item['score_delta']}" if item["score_delta"] >= 0 else str(item["score_delta"])
+
+                lines.append(
+                    f"{idx}. {item['name']}：排名 {item['prev_rank']} -> {item['latest_rank']}，{rank_text}；"
+                    f"积分 {item['prev_score']} -> {item['latest_score']}（{score_text}）"
+                )
+        else:
+            lines.append("没有可展示的仍在榜玩家。")
 
         if want_best:
-            lines.append("说明：最强=排名上升最多。")
+            lines.append("排序：排名上升越多越靠前；排名变化相同时，积分增加越多越靠前。")
         else:
-            lines.append("说明：最菜=排名下降最多，仅群聊娱乐。")
+            lines.append("排序：排名下降越多越靠前；排名变化相同时，积分减少越多越靠前。")
+            if dropped:
+                dropped.sort(key=lambda x: x["prev_rank"])
+                names = "、".join(
+                    f"{item['name']}（原{item['prev_rank']}名）"
+                    for item in dropped[:20]
+                )
+                more = "" if len(dropped) <= 20 else f" 等{len(dropped)}人"
+                lines.append(f"PS：以下人掉出榜单不统计：{names}{more}")
+
         return "\n".join(lines)
 
     def _format_daily_official(
@@ -1633,10 +1672,10 @@ class Main(Star):
             "战棋榜 单打排行 50             显示单打前50名\n"
             "\n"
             "涨跌榜：\n"
-            "战棋榜 最强                    显示双打+单打排名上升最多的玩家\n"
+            "战棋榜 最强                    显示双打+单打排名上升最多的玩家，带编号\n"
             "战棋榜 最强 20                 显示双打+单打排名上升最多前20名\n"
             "战棋榜 最强 bg 20              只显示单打排名上升最多前20名\n"
-            "战棋榜 最菜                    显示双打+单打排名下降最多的玩家\n"
+            "战棋榜 最菜                    显示双打+单打排名下降最多的玩家，带编号\n"
             "战棋榜 最菜 20                 显示双打+单打排名下降最多前20名\n"
             "战棋榜 最菜 bg 20              只显示单打排名下降最多前20名\n"
             "\n"
