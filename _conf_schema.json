@@ -39,6 +39,24 @@
     "default": 300,
     "hint": "避免频繁请求接口。建议 180-600。"
   },
+  "season_probe_max_id": {
+    "description": "赛季探测上限",
+    "type": "int",
+    "default": 40,
+    "hint": "当前赛季 ID 获取失败、查询自动补历史、战棋榜 历史 刷新都会用到。会从 1 扫到这个数字；未来赛季号超过 40 时再调高。"
+  },
+  "history_season_display_limit": {
+    "description": "榜单展示历史赛季数量",
+    "type": "int",
+    "default": 3,
+    "hint": "普通榜单/查人时，昵称后最多显示几个已归档历史赛季排名。填 0 可隐藏。"
+  },
+  "auto_history_archive_on_query": {
+    "description": "查询时自动补历史赛季归档",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，普通查人/查榜第一次需要历史排名时会自动下载缺失历史赛季；已下载过的不再重复请求。自动记录任务不受影响，只刷新最新赛季。"
+  },
   "enable_fake_rank": {
     "description": "启用手动装逼榜",
     "type": "bool",

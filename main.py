@@ -20,7 +20,7 @@ class Main(Star):
     """
     炉石传说国服排行榜查询插件。
 
-    v1.7.4：
+    v1.7.5：
     - 战棋榜 最强/最菜 改为涨跌榜，不再是当前榜单前后名。
     - 战棋榜 双打排行 / 战棋榜 单打排行：当前排行榜，默认 20 行，可加数字。
     - 查人精确命中时显示排名上下文；例如第 500 名显示 450-500 区间。
@@ -29,6 +29,9 @@ class Main(Star):
     - 修复 /hsrank 等命令同时被 command 和 regex 命中导致重复回复的问题。
     - 默认查人时只显示命中的模式：只有双打显示双打，只有单打显示单打，双打单打都有才显示两个。
     - 数据文件迁移到 AstrBot/data/plugin_data/astrbot_plugin_hs_rank/，并自动兼容旧路径。
+    - 历史快照增加赛季元信息，涨跌统计只优先比较同赛季记录，避免混入旧赛季。
+    - 支持探测并下载国服历史赛季榜单归档。
+    - 当前榜单展示可带出同名玩家历史赛季排名。
     """
 
     CN_API = "https://webapi.blizzard.cn/hs-rank-api-server/api/game/ranks"
@@ -36,6 +39,7 @@ class Main(Star):
 
     CACHE_TTL_SECONDS = 300
     FALLBACK_SEASON_ID = 17
+    SEASON_PROBE_MAX_ID = 40
 
     MODE_ALIASES = {
         "duo": "battlegroundsduo",
@@ -66,6 +70,10 @@ class Main(Star):
         self.session: aiohttp.ClientSession | None = None
         self.cache: dict[str, dict] = {}
         self.locks = {
+            "battlegroundsduo": asyncio.Lock(),
+            "battlegrounds": asyncio.Lock(),
+        }
+        self.archive_locks = {
             "battlegroundsduo": asyncio.Lock(),
             "battlegrounds": asyncio.Lock(),
         }
@@ -226,6 +234,16 @@ class Main(Star):
                     yield result
                 return
 
+            if cmd in {"history", "历史", "历史记录", "历史日期", "记录日期", "dates"}:
+                async for result in self._handle_history_dates(event, tokens[1:]):
+                    yield result
+                return
+
+            if cmd in {"archive", "archives", "下载历史", "历史下载", "归档历史", "赛季下载", "赛季归档"}:
+                async for result in self._handle_history_archive(event, tokens[1:]):
+                    yield result
+                return
+
             if cmd in {"best", "strong", "最强", "今日最强"}:
                 async for result in self._handle_trend_board(event, want_best=True, args=tokens[1:]):
                     yield result
@@ -342,10 +360,10 @@ class Main(Star):
                 return
 
             if cmd in {"双打排行", "双打排名", "duo排行", "duo排名"}:
-                limit = self._parse_int(tokens[1], self._default_top_limit()) if len(tokens) >= 2 else self._default_top_limit()
+                limit, page = self._parse_limit_page(tokens[1:], self._default_top_limit())
                 mode = "battlegroundsduo"
-                data = await self._get_leaderboard(mode)
-                rows = data["rows"][:limit]
+                data = await self._get_leaderboard(mode, include_history=True)
+                rows = data["rows"]
                 yield event.plain_result(
                     self._format_rows(
                         mode=mode,
@@ -354,15 +372,17 @@ class Main(Star):
                         title_suffix=f"前{limit}名",
                         total_count=len(rows),
                         limit=limit,
+                        page=page,
+                        next_command=f"战棋榜 双打排行 {limit} {page + 1}",
                     )
                 )
                 return
 
             if cmd in {"单打排行", "单打排名", "bg排行", "bg排名"}:
-                limit = self._parse_int(tokens[1], self._default_top_limit()) if len(tokens) >= 2 else self._default_top_limit()
+                limit, page = self._parse_limit_page(tokens[1:], self._default_top_limit())
                 mode = "battlegrounds"
-                data = await self._get_leaderboard(mode)
-                rows = data["rows"][:limit]
+                data = await self._get_leaderboard(mode, include_history=True)
+                rows = data["rows"]
                 yield event.plain_result(
                     self._format_rows(
                         mode=mode,
@@ -371,29 +391,33 @@ class Main(Star):
                         title_suffix=f"前{limit}名",
                         total_count=len(rows),
                         limit=limit,
+                        page=page,
+                        next_command=f"战棋榜 单打排行 {limit} {page + 1}",
                     )
                 )
                 return
 
             if cmd in {"top", "前", "排行榜", "rank"}:
                 mode, rest, has_mode = self._parse_optional_mode(tokens[1:])
-                limit = self._parse_int(rest[0], self._default_top_limit()) if rest else self._default_top_limit()
+                limit, page = self._parse_limit_page(rest, self._default_top_limit())
 
                 if has_mode:
-                    data = await self._get_leaderboard(mode)
-                    rows = data["rows"][:limit]
+                    data = await self._get_leaderboard(mode, include_history=True)
+                    rows = data["rows"]
                     yield event.plain_result(
                         self._format_rows(
                             mode=mode,
                             rows=rows,
                             data=data,
-                            title_suffix=f"前{limit}名",
-                            total_count=len(rows),
-                            limit=limit,
+                        title_suffix=f"前{limit}名",
+                        total_count=len(rows),
+                        limit=limit,
+                        page=page,
+                        next_command=f"战棋榜 top {self._mode_short(mode)} {limit} {page + 1}",
                         )
                     )
                 else:
-                    yield event.plain_result(await self._format_top_both(limit))
+                    yield event.plain_result(await self._format_top_both(limit, page))
                 return
 
             if cmd in {"id", "查id", "查询id", "昵称"}:
@@ -404,7 +428,7 @@ class Main(Star):
 
                 nickname = " ".join(rest).strip()
                 if has_mode:
-                    data = await self._get_leaderboard(mode)
+                    data = await self._get_leaderboard(mode, include_history=True)
                     yield event.plain_result(
                         self._format_exact_context(
                             mode=mode,
@@ -424,10 +448,10 @@ class Main(Star):
                     return
 
                 keyword = rest[0]
-                limit = self._parse_int(rest[1], self._default_query_limit()) if len(rest) >= 2 else self._default_query_limit()
+                limit, page = self._parse_limit_page(rest[1:], self._default_query_limit())
 
                 if has_mode:
-                    data = await self._get_leaderboard(mode)
+                    data = await self._get_leaderboard(mode, include_history=True)
                     rows = [
                         row for row in data["rows"]
                         if keyword.lower() in row["name"].lower()
@@ -435,15 +459,17 @@ class Main(Star):
                     yield event.plain_result(
                         self._format_rows(
                             mode=mode,
-                            rows=rows[:limit],
+                            rows=rows,
                             data=data,
                             title_suffix=f"昵称含有'{keyword}'的名单",
                             total_count=len(rows),
                             limit=limit,
+                            page=page,
+                            next_command=f"战棋榜 {self._mode_short(mode)} {keyword} {limit} {page + 1}",
                         )
                     )
                 else:
-                    yield event.plain_result(await self._format_search_both(keyword, exact=False, limit=limit))
+                    yield event.plain_result(await self._format_search_both(keyword, exact=False, limit=limit, page=page))
                 return
 
             mode = self._mode_from_token(tokens[0])
@@ -451,8 +477,9 @@ class Main(Star):
             if mode:
                 if len(tokens) == 1:
                     limit = self._default_top_limit()
-                    data = await self._get_leaderboard(mode)
-                    rows = data["rows"][:limit]
+                    page = 1
+                    data = await self._get_leaderboard(mode, include_history=True)
+                    rows = data["rows"]
                     yield event.plain_result(
                         self._format_rows(
                             mode=mode,
@@ -461,14 +488,34 @@ class Main(Star):
                             title_suffix=f"前{limit}名",
                             total_count=len(rows),
                             limit=limit,
+                            page=page,
+                            next_command=f"战棋榜 top {self._mode_short(mode)} {limit} {page + 1}",
+                        )
+                    )
+                    return
+
+                if self._parse_int_unlimited(tokens[1]) is not None:
+                    limit, page = self._parse_limit_page(tokens[1:], self._default_top_limit())
+                    data = await self._get_leaderboard(mode, include_history=True)
+                    rows = data["rows"]
+                    yield event.plain_result(
+                        self._format_rows(
+                            mode=mode,
+                            rows=rows,
+                            data=data,
+                            title_suffix=f"前{limit}名",
+                            total_count=len(rows),
+                            limit=limit,
+                            page=page,
+                            next_command=f"战棋榜 top {self._mode_short(mode)} {limit} {page + 1}",
                         )
                     )
                     return
 
                 keyword = tokens[1]
-                limit = self._parse_int(tokens[2], self._default_query_limit()) if len(tokens) >= 3 else self._default_query_limit()
+                limit, page = self._parse_limit_page(tokens[2:], self._default_query_limit())
 
-                data = await self._get_leaderboard(mode)
+                data = await self._get_leaderboard(mode, include_history=True)
                 rows = [
                     row for row in data["rows"]
                     if keyword.lower() in row["name"].lower()
@@ -477,11 +524,13 @@ class Main(Star):
                 yield event.plain_result(
                     self._format_rows(
                         mode=mode,
-                        rows=rows[:limit],
+                        rows=rows,
                         data=data,
                         title_suffix=f"昵称含有'{keyword}'的名单",
                         total_count=len(rows),
                         limit=limit,
+                        page=page,
+                        next_command=f"战棋榜 {self._mode_short(mode)} {keyword} {limit} {page + 1}",
                     )
                 )
                 return
@@ -547,6 +596,15 @@ class Main(Star):
     def _max_output_limit(self) -> int:
         return self._config_int("max_output_limit", 100, 1, 300)
 
+    def _season_probe_max_id(self) -> int:
+        return self._config_int("season_probe_max_id", self.SEASON_PROBE_MAX_ID, self.FALLBACK_SEASON_ID, 100)
+
+    def _history_season_display_limit(self) -> int:
+        return self._config_int("history_season_display_limit", 3, 0, 10)
+
+    def _auto_history_archive_on_query(self) -> bool:
+        return self._config_bool("auto_history_archive_on_query", True)
+
     def _default_daily_mode(self) -> str:
         mode = self._config_str("default_daily_mode", "duo")
         return self.MODE_ALIASES.get(mode.lower(), "battlegroundsduo")
@@ -579,6 +637,10 @@ class Main(Star):
             "5. 是否只有管理员能改手动榜 require_admin_for_fake_ops\n"
             "6. 管理员 QQ/用户ID 列表 admin_ids\n"
             "7. 历史记录文件路径 state_file_path\n"
+            "8. 赛季探测上限 season_probe_max_id\n"
+            "9. 榜单展示历史赛季数量 history_season_display_limit\n"
+            "10. 查询时自动补历史赛季 auto_history_archive_on_query\n"
+            "历史赛季归档、每日快照、手动榜都保存在 state_file_path 指向的状态文件里。\n"
             "普通查询不需要管理员：战棋榜 某人 / 战棋榜 涨跌 某人"
         )
 
@@ -589,7 +651,7 @@ class Main(Star):
             data = await self._get_leaderboard(mode, force=True)
             lines.append(
                 f"{self.MODE_NAMES[mode]}：官方 {len(data['official_rows'])} 条，"
-                f"手动添加 {len(self._get_fake_rows(mode))} 条"
+                f"手动添加 {len(self._get_fake_rows(mode))} 条，赛季 {data.get('season_id')}"
             )
         return "已刷新并记录今日榜单：\n" + "\n".join(lines)
 
@@ -607,16 +669,123 @@ class Main(Star):
         nickname = " ".join(rest).strip()
 
         if has_mode:
-            await self._get_leaderboard(mode)
-            yield event.plain_result(self._format_trend(mode, nickname))
+            data = await self._get_leaderboard(mode)
+            yield event.plain_result(self._format_trend(mode, nickname, data.get("season_id")))
             return
 
         sections = []
         for one_mode in self.MODES:
-            await self._get_leaderboard(one_mode)
-            sections.append(self._format_trend(one_mode, nickname))
+            data = await self._get_leaderboard(one_mode)
+            sections.append(self._format_trend(one_mode, nickname, data.get("season_id")))
         yield event.plain_result("\n\n".join(sections))
 
+    async def _handle_history_dates(self, event: AstrMessageEvent, args: list[str]):
+        archive_words = {"download", "archive", "下载", "归档", "下载历史", "历史下载", "归档历史", "赛季下载", "赛季归档"}
+        if args and args[0].lower() in archive_words:
+            async for result in self._handle_history_archive(event, args[1:]):
+                yield result
+            return
+
+        mode, rest, has_mode = self._parse_optional_mode(args)
+        if has_mode and rest and rest[0].lower() in archive_words:
+            async for result in self._handle_history_archive(event, [self._mode_short(mode)] + rest[1:]):
+                yield result
+            return
+
+        force_words = {"force", "refresh", "刷新", "重下", "重新下载", "覆盖"}
+        if args and any(str(token).lower() in force_words for token in args):
+            archive_args = [self._mode_short(mode)] + rest if has_mode else args
+            async for result in self._handle_history_archive(event, archive_args):
+                yield result
+            return
+
+        if rest and self._parse_int_unlimited(rest[0]) is None:
+            nickname = " ".join(rest).strip()
+            if has_mode:
+                await self._get_leaderboard(mode, include_history=True)
+                yield event.plain_result(self._format_archive_player_history(mode, nickname))
+                return
+
+            sections = []
+            for one_mode in self.MODES:
+                await self._get_leaderboard(one_mode, include_history=True)
+                sections.append(self._format_archive_player_history(one_mode, nickname))
+            yield event.plain_result("\n\n".join(sections))
+            return
+
+        limit = self._parse_int(rest[0], 30) if rest else 30
+
+        if has_mode:
+            await self._get_leaderboard(mode, include_history=True)
+            yield event.plain_result(self._format_history_dates(mode, limit))
+            return
+
+        for one_mode in self.MODES:
+            await self._get_leaderboard(one_mode, include_history=True)
+        sections = [self._format_history_dates(one_mode, limit) for one_mode in self.MODES]
+        yield event.plain_result("\n\n".join(sections))
+
+    async def _handle_history_archive(self, event: AstrMessageEvent, args: list[str]):
+        force_words = {"force", "refresh", "刷新", "重下", "重新下载", "覆盖"}
+        force = any(str(token).lower() in force_words for token in args)
+        args = [token for token in args if str(token).lower() not in force_words]
+
+        mode, rest, has_mode = self._parse_optional_mode(args)
+        max_id = self._season_probe_max_id()
+        if rest:
+            parsed = self._parse_int_unlimited(rest[0])
+            if parsed is not None:
+                max_id = max(1, min(parsed, 100))
+
+        modes = [mode] if has_mode else self.MODES
+        lines = [f"历史赛季归档完成（探测 1-{max_id}）："]
+
+        for one_mode in modes:
+            available_seasons = await self._probe_cn_seasons(one_mode, max_id)
+            self._archive_probe_meta(one_mode).update({
+                "max_id": max_id,
+                "available": available_seasons,
+                "probed_at": int(time.time()),
+            })
+            archive_map = self._season_archive_map(one_mode)
+
+            if not available_seasons:
+                lines.append(f"{self.MODE_NAMES[one_mode]}：没有探测到可用历史赛季。")
+                continue
+
+            downloaded = []
+            skipped = []
+            failed = []
+
+            for season_id in available_seasons:
+                if str(season_id) in archive_map and not force:
+                    item = archive_map.get(str(season_id)) or {}
+                    total = item.get("total") or len(item.get("rows") or [])
+                    skipped.append(f"{season_id}({total}人)")
+                    continue
+
+                try:
+                    data = await self._fetch_full_cn_leaderboard_for_season(one_mode, season_id)
+                    self._record_season_archive(one_mode, data)
+                    downloaded.append(f"{season_id}({len(data.get('official_rows', []))}人)")
+                except Exception as e:
+                    failed.append(f"{season_id}({str(e)[:30]})")
+
+            self._save_state()
+
+            lines.append(
+                f"{self.MODE_NAMES[one_mode]}：探测到 {', '.join(str(x) for x in available_seasons)}；"
+                f"下载 {len(downloaded)} 个，跳过 {len(skipped)} 个。"
+            )
+            if downloaded:
+                lines.append(f"  已下载：{'、'.join(downloaded)}")
+            if skipped:
+                lines.append(f"  已存在：{'、'.join(skipped)}")
+            if failed:
+                lines.append(f"  失败：{'、'.join(failed)}")
+
+        lines.append("可用 战棋榜 历史 查看已归档赛季；需要覆盖重下可用 战棋榜 历史 刷新。")
+        yield event.plain_result("\n".join(lines))
 
     async def _handle_trend_board(self, event: AstrMessageEvent, want_best: bool, args: list[str] | None = None):
         """
@@ -630,14 +799,14 @@ class Main(Star):
         limit = self._parse_int(rest[0], self._default_daily_limit()) if rest else self._default_daily_limit()
 
         if has_mode:
-            await self._get_leaderboard(mode)
-            yield event.plain_result(self._format_trend_board(mode, want_best, limit))
+            data = await self._get_leaderboard(mode)
+            yield event.plain_result(self._format_trend_board(mode, want_best, limit, data.get("season_id")))
             return
 
         sections = []
         for one_mode in self.MODES:
-            await self._get_leaderboard(one_mode)
-            sections.append(self._format_trend_board(one_mode, want_best, limit))
+            data = await self._get_leaderboard(one_mode)
+            sections.append(self._format_trend_board(one_mode, want_best, limit, data.get("season_id")))
         yield event.plain_result("\n\n".join(sections))
 
     async def _handle_daily_official(self, event: AstrMessageEvent, want_best: bool, args: list[str] | None = None):
@@ -720,7 +889,7 @@ class Main(Star):
             f"积分:{score}（手动添加）"
         )
 
-    async def _format_search_both(self, keyword: str, exact: bool, limit: int) -> str:
+    async def _format_search_both(self, keyword: str, exact: bool, limit: int, page: int = 1) -> str:
         """
         默认查人逻辑：
         - 后台同时查双打和单打。
@@ -735,7 +904,7 @@ class Main(Star):
         hit_modes = []
 
         for mode in self.MODES:
-            data = await self._get_leaderboard(mode)
+            data = await self._get_leaderboard(mode, include_history=True)
 
             if exact:
                 rows = [
@@ -769,11 +938,13 @@ class Main(Star):
                     sections.append(
                         self._format_rows(
                             mode=mode,
-                            rows=rows[:limit],
+                            rows=rows,
                             data=data,
                             title_suffix=suffix,
                             total_count=len(rows),
                             limit=limit,
+                            page=page,
+                            next_command=f"战棋榜 {self._mode_short(mode)} {keyword} {limit} {page + 1}",
                         )
                     )
 
@@ -792,11 +963,11 @@ class Main(Star):
 
         return header + "\n\n" + "\n\n".join(sections)
 
-    async def _format_top_both(self, limit: int) -> str:
+    async def _format_top_both(self, limit: int, page: int = 1) -> str:
         sections = []
         for mode in self.MODES:
-            data = await self._get_leaderboard(mode)
-            rows = data["rows"][:limit]
+            data = await self._get_leaderboard(mode, include_history=True)
+            rows = data["rows"]
             sections.append(
                 self._format_rows(
                     mode=mode,
@@ -805,6 +976,8 @@ class Main(Star):
                     title_suffix=f"前{limit}名",
                     total_count=len(rows),
                     limit=limit,
+                    page=page,
+                    next_command=f"战棋榜 top {self._mode_short(mode)} {limit} {page + 1}",
                 )
             )
         return "\n\n".join(sections)
@@ -897,6 +1070,19 @@ class Main(Star):
                 "battlegroundsduo": {},
                 "battlegrounds": {},
             },
+            "history_meta": {
+                "battlegroundsduo": {},
+                "battlegrounds": {},
+            },
+            "season_archives": {
+                "battlegroundsduo": {},
+                "battlegrounds": {},
+            },
+            "season_archive_probe": {
+                "battlegroundsduo": {},
+                "battlegrounds": {},
+            },
+            "last_season_ids": {},
         }
 
     def _load_state(self) -> dict:
@@ -910,9 +1096,16 @@ class Main(Star):
 
                 data.setdefault("fake_entries", self._default_fake_entries())
                 data.setdefault("history", {})
+                data.setdefault("history_meta", {})
+                data.setdefault("season_archives", {})
+                data.setdefault("season_archive_probe", {})
+                data.setdefault("last_season_ids", {})
                 for mode in self.MODES:
                     data["fake_entries"].setdefault(mode, [])
                     data["history"].setdefault(mode, {})
+                    data["history_meta"].setdefault(mode, {})
+                    data["season_archives"].setdefault(mode, {})
+                    data["season_archive_probe"].setdefault(mode, {})
 
                 # 兼容旧版：旧字段 admins / bindings 即使存在，新版也不再使用。
                 return data
@@ -943,11 +1136,13 @@ class Main(Star):
     def _today_str(self) -> str:
         return datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
 
-    def _record_history(self, mode: str, official_rows: list[dict]):
+    def _record_history(self, mode: str, official_rows: list[dict], season_id: int | str | None = None, total: int | None = None):
         today = self._today_str()
         history = self.state.setdefault("history", {}).setdefault(mode, {})
+        history_meta = self.state.setdefault("history_meta", {}).setdefault(mode, {})
 
         snapshot: dict[str, dict] = {}
+        recorded_at = int(time.time())
         for row in official_rows:
             name = str(row.get("name", "")).strip()
             if not name:
@@ -970,34 +1165,374 @@ class Main(Star):
                     "name": name,
                     "rank": rank,
                     "score": score,
-                    "recorded_at": int(time.time()),
+                    "recorded_at": recorded_at,
                 }
 
         history[today] = snapshot
+        meta = {
+            "season_id": self._normalize_season_id(season_id),
+            "total": total if total is not None else len(official_rows),
+            "recorded_at": recorded_at,
+        }
+        history_meta[today] = meta
+
+        normalized_season_id = self._normalize_season_id(season_id)
+        if normalized_season_id is not None:
+            self.state.setdefault("last_season_ids", {})[mode] = normalized_season_id
 
         dates = sorted(history.keys())
         for old_date in dates[:-60]:
             history.pop(old_date, None)
+            history_meta.pop(old_date, None)
 
         self._save_state()
 
-    def _find_history_records(self, mode: str, nickname: str) -> list[tuple[str, dict]]:
+    def _normalize_season_id(self, value) -> int | None:
+        try:
+            if value in (None, ""):
+                return None
+            return int(value)
+        except Exception:
+            return None
+
+    def _last_season_id(self, mode: str) -> int | None:
+        return self._normalize_season_id(
+            self.state.setdefault("last_season_ids", {}).get(mode)
+        )
+
+    def _season_archive_map(self, mode: str) -> dict:
+        archives = self.state.setdefault("season_archives", {}).setdefault(mode, {})
+        if not isinstance(archives, dict):
+            archives = {}
+            self.state.setdefault("season_archives", {})[mode] = archives
+        return archives
+
+    def _archive_season_ids(self, mode: str) -> list[int]:
+        season_ids = []
+        for key in self._season_archive_map(mode).keys():
+            season_id = self._normalize_season_id(key)
+            if season_id is not None:
+                season_ids.append(season_id)
+        return sorted(set(season_ids))
+
+    def _archive_season_summary(self, mode: str) -> str:
+        archives = self._season_archive_map(mode)
+        parts = []
+        for season_id in self._archive_season_ids(mode):
+            item = archives.get(str(season_id)) or {}
+            total = item.get("total") or len(item.get("rows") or [])
+            parts.append(f"{season_id}({total}人)")
+        return "、".join(parts)
+
+    def _record_season_archive(self, mode: str, data: dict):
+        season_id = self._normalize_season_id(data.get("season_id"))
+        if season_id is None:
+            return
+
+        rows = data.get("official_rows", [])
+        archives = self._season_archive_map(mode)
+        archives[str(season_id)] = {
+            "season_id": season_id,
+            "total": data.get("total") or len(rows),
+            "official_update": data.get("official_update", ""),
+            "fetched_at": int(time.time()),
+            "rows": rows,
+        }
+
+        last_season_id = self._last_season_id(mode)
+        if last_season_id is None or season_id > last_season_id:
+            self.state.setdefault("last_season_ids", {})[mode] = season_id
+
+    def _archive_probe_meta(self, mode: str) -> dict:
+        meta = self.state.setdefault("season_archive_probe", {}).setdefault(mode, {})
+        if not isinstance(meta, dict):
+            meta = {}
+            self.state.setdefault("season_archive_probe", {})[mode] = meta
+        return meta
+
+    async def _ensure_history_archive_for_display(self, mode: str, current_season_id: int | str | None = None):
+        if not self._auto_history_archive_on_query() or self._history_season_display_limit() <= 0:
+            return
+
+        async with self.archive_locks[mode]:
+            max_id = self._season_probe_max_id()
+            current_season = self._normalize_season_id(current_season_id)
+            meta = self._archive_probe_meta(mode)
+
+            available = []
+            meta_max_id = self._normalize_season_id(meta.get("max_id")) or 0
+            if meta_max_id >= max_id and isinstance(meta.get("available"), list):
+                available = [
+                    season_id for season_id in (
+                        self._normalize_season_id(value) for value in meta.get("available", [])
+                    )
+                    if season_id is not None
+                ]
+            else:
+                available = await self._probe_cn_seasons(mode, max_id)
+                meta.update({
+                    "max_id": max_id,
+                    "available": available,
+                    "probed_at": int(time.time()),
+                })
+
+            archive_map = self._season_archive_map(mode)
+            missing = [
+                season_id for season_id in available
+                if season_id != current_season and str(season_id) not in archive_map
+            ]
+
+            if not missing:
+                self._save_state()
+                return
+
+            for season_id in missing:
+                try:
+                    data = await self._fetch_full_cn_leaderboard_for_season(mode, season_id)
+                    self._record_season_archive(mode, data)
+                except Exception as e:
+                    logger.warning(f"自动归档{self.MODE_NAMES.get(mode, mode)}赛季 {season_id} 失败：{e}")
+
+            self._save_state()
+
+    def _history_season_hits(
+        self,
+        mode: str,
+        row: dict,
+        current_season_id: int | str | None = None,
+    ) -> list[dict]:
+        name = str(row.get("name", "")).strip()
+        if not name:
+            return []
+
+        current_season = self._normalize_season_id(current_season_id)
+        key = name.lower()
+        archives = self._season_archive_map(mode)
+        hits = []
+
+        for season_id in sorted(self._archive_season_ids(mode), reverse=True):
+            if current_season is not None and season_id == current_season:
+                continue
+
+            archive = archives.get(str(season_id)) or {}
+            rows = archive.get("rows") or []
+            matches = [
+                item for item in rows
+                if str(item.get("name", "")).strip().lower() == key
+            ]
+            if not matches:
+                continue
+
+            def rank_key(item: dict) -> int:
+                try:
+                    return int(item.get("rank"))
+                except Exception:
+                    return 999999
+
+            best = sorted(matches, key=rank_key)[0]
+            try:
+                rank = int(best.get("rank"))
+                score = int(best.get("score", 0))
+            except Exception:
+                continue
+
+            hits.append({
+                "season_id": season_id,
+                "rank": rank,
+                "score": score,
+            })
+
+        return hits
+
+    def _history_season_suffix(
+        self,
+        mode: str,
+        row: dict,
+        current_season_id: int | str | None = None,
+    ) -> str:
+        limit = self._history_season_display_limit()
+        if limit <= 0 or row.get("fake"):
+            return ""
+
+        hits = self._history_season_hits(mode, row, current_season_id)
+        if not hits:
+            return ""
+
+        shown = hits[:limit]
+        parts = [
+            f"{item['season_id']}赛季第{item['rank']}名 {item['score']}分"
+            for item in shown
+        ]
+        more = f"；还有{len(hits) - len(shown)}季未显示" if len(hits) > len(shown) else ""
+        return f"（历史：{'；'.join(parts)}{more}）"
+
+    def _format_archive_player_history(self, mode: str, keyword: str) -> str:
+        key = keyword.strip().lower()
+        if not key:
+            return f"【{self.MODE_NAMES[mode]}】历史赛季排名：请提供昵称。"
+
+        archives = self._season_archive_map(mode)
+        exact_hits = []
+        fuzzy_hits = []
+
+        for season_id in sorted(self._archive_season_ids(mode), reverse=True):
+            archive = archives.get(str(season_id)) or {}
+            rows = archive.get("rows") or []
+            season_exact = []
+            season_fuzzy = []
+
+            for row in rows:
+                name = str(row.get("name", "")).strip()
+                if not name:
+                    continue
+                name_key = name.lower()
+                if name_key == key:
+                    season_exact.append(row)
+                elif key in name_key:
+                    season_fuzzy.append(row)
+
+            source = season_exact or season_fuzzy
+            for row in source:
+                try:
+                    rank = int(row.get("rank"))
+                    score = int(row.get("score", 0))
+                except Exception:
+                    continue
+
+                item = {
+                    "season_id": season_id,
+                    "rank": rank,
+                    "score": score,
+                    "name": str(row.get("name", "")),
+                }
+                if season_exact:
+                    exact_hits.append(item)
+                else:
+                    fuzzy_hits.append(item)
+
+        hits = exact_hits or fuzzy_hits
+        title_name = hits[0]["name"] if hits and exact_hits else keyword
+        lines = [f"【{self.MODE_NAMES[mode]}】历史赛季排名：{title_name}"]
+
+        if not hits:
+            archive_summary = self._archive_season_summary(mode)
+            if archive_summary:
+                lines.append("已归档赛季里没有找到这个昵称。")
+            else:
+                lines.append("还没有历史赛季归档；执行 战棋榜 历史 会自动补档。")
+            return "\n".join(lines)
+
+        if not exact_hits:
+            lines.append("未找到精确同名，以下为昵称关键词命中：")
+
+        for item in hits[:50]:
+            name_part = "" if exact_hits else f" 昵称:{item['name']}"
+            lines.append(f"{item['season_id']}赛季：第{item['rank']}名，{item['score']}分{name_part}")
+
+        if len(hits) > 50:
+            lines.append(f"……共命中 {len(hits)} 条，仅显示前 50 条。")
+
+        return "\n".join(lines)
+
+    def _history_dates_for_mode(self, mode: str, season_id: int | str | None = None) -> list[str]:
+        target_season = self._normalize_season_id(season_id)
+        history = self.state.setdefault("history", {}).setdefault(mode, {})
+        dates = sorted([d for d in history.keys() if isinstance(history.get(d), dict)])
+
+        if target_season is None:
+            return dates
+
+        meta_map = self.state.setdefault("history_meta", {}).setdefault(mode, {})
+        same_season = []
+        unknown_season = []
+
+        for date in dates:
+            meta_season = self._normalize_season_id((meta_map.get(date) or {}).get("season_id"))
+            if meta_season == target_season:
+                same_season.append(date)
+            elif meta_season is None:
+                unknown_season.append(date)
+
+        return same_season if same_season else unknown_season
+
+    def _format_recorded_time(self, ts) -> str:
+        try:
+            return self._format_fetch_time(float(ts))
+        except Exception:
+            return ""
+
+    def _format_history_dates(self, mode: str, limit: int) -> str:
+        history = self.state.setdefault("history", {}).setdefault(mode, {})
+        meta_map = self.state.setdefault("history_meta", {}).setdefault(mode, {})
+        dates = sorted([d for d in history.keys() if isinstance(history.get(d), dict)])
+        archive_summary = self._archive_season_summary(mode)
+
+        if not dates:
+            lines = [
+                f"【{self.MODE_NAMES[mode]}】历史快照日期：",
+                "还没有每日快照记录。可以先执行 战棋榜 更新 记录今日榜单。",
+            ]
+            if archive_summary:
+                lines.append(f"已归档历史赛季：{archive_summary}")
+            else:
+                lines.append("还没有归档历史赛季。执行 战棋榜 历史 会自动补档；需要覆盖重下可用 战棋榜 历史 刷新。")
+            return "\n".join(lines)
+
+        shown_dates = dates[-limit:]
+        last_season_id = self._last_season_id(mode)
+        lines = [f"【{self.MODE_NAMES[mode]}】历史快照日期（共 {len(dates)} 天，显示最近 {len(shown_dates)} 天）："]
+
+        unknown_count = 0
+        season_counts: dict[int, int] = {}
+        for date in shown_dates:
+            snapshot = history.get(date, {})
+            meta = meta_map.get(date) or {}
+            season_id = self._normalize_season_id(meta.get("season_id"))
+            if season_id is None:
+                unknown_count += 1
+                season_text = "赛季未知"
+            else:
+                season_counts[season_id] = season_counts.get(season_id, 0) + 1
+                season_text = f"赛季{season_id}"
+
+            total = meta.get("total") or len(snapshot)
+            recorded_time = self._format_recorded_time(meta.get("recorded_at"))
+            time_text = f"，记录时间 {recorded_time}" if recorded_time else ""
+            lines.append(f"{date}：{season_text}，{total}人{time_text}")
+
+        if last_season_id is not None:
+            lines.append(f"最近成功获取的赛季：{last_season_id}")
+
+        if archive_summary:
+            lines.append(f"已归档历史赛季：{archive_summary}")
+
+        if len(season_counts) > 1:
+            summary = "、".join(f"赛季{sid} {count}天" for sid, count in sorted(season_counts.items()))
+            lines.append(f"提示：最近记录里有多个赛季：{summary}；涨跌统计会优先只比较同赛季。")
+
+        if unknown_count:
+            lines.append("提示：赛季未知多半是旧版记录；有当前赛季记录后，涨跌统计会自动优先只比较同赛季，避免旧赛季串台。")
+
+        return "\n".join(lines)
+
+    def _find_history_records(self, mode: str, nickname: str, season_id: int | str | None = None) -> list[tuple[str, dict]]:
         key = nickname.lower()
         history = self.state.setdefault("history", {}).setdefault(mode, {})
         records = []
-        for date in sorted(history.keys()):
+        for date in self._history_dates_for_mode(mode, season_id):
             item = history.get(date, {}).get(key)
             if item:
                 records.append((date, item))
         return records
 
-    def _format_trend(self, mode: str, nickname: str) -> str:
-        records = self._find_history_records(mode, nickname)
+    def _format_trend(self, mode: str, nickname: str, season_id: int | str | None = None) -> str:
+        records = self._find_history_records(mode, nickname, season_id)
         fake = self._find_fake_by_name(mode, nickname)
+        season_text = f"（赛季{self._normalize_season_id(season_id)}）" if self._normalize_season_id(season_id) is not None else ""
 
         if not records:
             lines = [
-                f"【{self.MODE_NAMES[mode]}】涨跌记录：{nickname}",
+                f"【{self.MODE_NAMES[mode]}】涨跌记录{season_text}：{nickname}",
                 "官方历史记录里还没有这个昵称。",
                 f"可以先执行 战棋榜 更新 或 战棋榜 记录 记录今日双模式榜单。",
             ]
@@ -1007,7 +1542,7 @@ class Main(Star):
                 )
             return "\n".join(lines)
 
-        lines = [f"【{self.MODE_NAMES[mode]}】涨跌记录：{records[-1][1].get('name', nickname)}"]
+        lines = [f"【{self.MODE_NAMES[mode]}】涨跌记录{season_text}：{records[-1][1].get('name', nickname)}"]
         for date, item in records[-7:]:
             lines.append(f"{date}：排名 {item['rank']}，积分 {item['score']}")
 
@@ -1116,19 +1651,21 @@ class Main(Star):
 
         return "\n\n".join(sections)
 
-    def _format_trend_board(self, mode: str, want_best: bool, limit: int) -> str:
+    def _format_trend_board(self, mode: str, want_best: bool, limit: int, season_id: int | str | None = None) -> str:
         """
         根据最近两次历史快照生成涨跌榜。
         最强：排名上升最多优先；排名变化相同时，积分增加更多优先。
         最菜：只统计仍在榜玩家的排名下降；掉出榜单玩家不参与排序，只在末尾 PS 提示。
         """
         history = self.state.setdefault("history", {}).setdefault(mode, {})
-        dates = sorted([d for d in history.keys() if isinstance(history.get(d), dict)])
+        dates = self._history_dates_for_mode(mode, season_id)
+        normalized_season_id = self._normalize_season_id(season_id)
+        season_text = f"（赛季{normalized_season_id}）" if normalized_season_id is not None else ""
 
         if len(dates) < 2:
             return (
-                f"【{self.MODE_NAMES[mode]}】{'最强涨幅榜' if want_best else '最菜跌幅榜'}：\n"
-                f"历史记录不足，至少需要两天/两次不同日期的榜单快照。\n"
+                f"【{self.MODE_NAMES[mode]}】{'最强涨幅榜' if want_best else '最菜跌幅榜'}{season_text}：\n"
+                f"同赛季历史记录不足，至少需要两天/两次不同日期的榜单快照。\n"
                 f"先执行“战棋榜 更新”，明天再执行一次后就能统计涨跌榜。"
             )
 
@@ -1186,7 +1723,7 @@ class Main(Star):
 
         if not changes and not dropped:
             return (
-                f"【{self.MODE_NAMES[mode]}】{'最强涨幅榜' if want_best else '最菜跌幅榜'}：\n"
+                f"【{self.MODE_NAMES[mode]}】{'最强涨幅榜' if want_best else '最菜跌幅榜'}{season_text}：\n"
                 f"{prev_date} -> {latest_date} 没有找到可对比的同名玩家。"
             )
 
@@ -1201,7 +1738,7 @@ class Main(Star):
             title = f"最菜跌幅榜前{limit}名"
 
         chosen = candidates[:limit]
-        lines = [f"【{self.MODE_NAMES[mode]}】{title}（{prev_date} -> {latest_date}）："]
+        lines = [f"【{self.MODE_NAMES[mode]}】{title}{season_text}（{prev_date} -> {latest_date}）："]
 
         if chosen:
             for idx, item in enumerate(chosen, 1):
@@ -1389,6 +1926,20 @@ class Main(Star):
         except Exception:
             return None
 
+    def _parse_limit_page(self, tokens: list[str], default_limit: int) -> tuple[int, int]:
+        limit = default_limit
+        page = 1
+
+        if tokens:
+            limit = self._parse_int(tokens[0], default_limit)
+
+        if len(tokens) >= 2:
+            parsed_page = self._parse_int_unlimited(tokens[1])
+            if parsed_page is not None:
+                page = max(1, parsed_page)
+
+        return limit, page
+
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
             timeout = aiohttp.ClientTimeout(total=45, connect=10, sock_read=30)
@@ -1415,13 +1966,13 @@ class Main(Star):
             except json.JSONDecodeError:
                 raise RuntimeError(f"接口返回不是 JSON: {text[:120]}")
 
-    async def _get_current_season_id(self) -> int:
+    async def _get_current_season_id(self, mode: str) -> int:
         try:
             data = await self._json_get(
                 self.INTL_API,
                 {
                     "region": "AP",
-                    "leaderboardId": "battlegrounds",
+                    "leaderboardId": mode,
                     "page": 1,
                 },
             )
@@ -1429,9 +1980,52 @@ class Main(Star):
             if season_id:
                 return int(season_id)
         except Exception as e:
-            logger.warning(f"读取当前赛季 ID 失败，使用默认赛季 ID：{e}")
+            logger.warning(f"读取当前赛季 ID 失败，尝试从国服接口探测当前赛季：{e}")
 
-        return self.FALLBACK_SEASON_ID
+        discovered = await self._discover_cn_season_id(mode)
+        if discovered is not None:
+            logger.warning(f"已从国服接口探测到当前赛季 ID：{discovered}")
+            return discovered
+
+        last_season_id = self._last_season_id(mode)
+        if last_season_id is not None:
+            logger.warning(f"赛季 ID 探测失败，临时使用最近一次成功赛季 ID：{last_season_id}")
+            return last_season_id
+
+        raise RuntimeError("无法获取当前赛季 ID，且没有可用的最近成功赛季记录。")
+
+    async def _discover_cn_season_id(self, mode: str) -> int | None:
+        for season_id in range(self._season_probe_max_id(), self.FALLBACK_SEASON_ID - 1, -1):
+            try:
+                data = await self._fetch_cn_page(mode, season_id, 1)
+                root = data.get("data") or {}
+                rows = root.get("list") or []
+                total = int(root.get("total") or len(rows) or 0)
+                if rows and total > 0:
+                    return season_id
+            except Exception:
+                continue
+        return None
+
+    async def _probe_cn_seasons(self, mode: str, max_id: int) -> list[int]:
+        max_id = max(1, min(max_id, 100))
+        sem = asyncio.Semaphore(6)
+
+        async def probe(season_id: int) -> int | None:
+            async with sem:
+                try:
+                    data = await self._fetch_cn_page(mode, season_id, 1)
+                    root = data.get("data") or {}
+                    rows = root.get("list") or []
+                    total = int(root.get("total") or len(rows) or 0)
+                    if rows and total > 0:
+                        return season_id
+                except Exception:
+                    return None
+            return None
+
+        results = await asyncio.gather(*(probe(season_id) for season_id in range(1, max_id + 1)))
+        return sorted([season_id for season_id in results if season_id is not None])
 
     async def _fetch_cn_page(self, mode: str, season_id: int, page: int) -> dict:
         data = await self._json_get(
@@ -1448,7 +2042,7 @@ class Main(Star):
 
         return data
 
-    async def _get_leaderboard(self, mode: str, force: bool = False) -> dict:
+    async def _get_leaderboard(self, mode: str, force: bool = False, include_history: bool = False) -> dict:
         now = time.time()
         cached = self.cache.get(mode)
 
@@ -1458,6 +2052,8 @@ class Main(Star):
             and now - cached["fetched_at"] < self.CACHE_TTL_SECONDS
         ):
             cached["rows"] = self._merge_fake_rows(mode, cached.get("official_rows", []))
+            if include_history:
+                await self._ensure_history_archive_for_display(mode, cached.get("season_id"))
             return cached
 
         async with self.locks[mode]:
@@ -1470,15 +2066,28 @@ class Main(Star):
                 and now - cached["fetched_at"] < self.CACHE_TTL_SECONDS
             ):
                 cached["rows"] = self._merge_fake_rows(mode, cached.get("official_rows", []))
+                if include_history:
+                    await self._ensure_history_archive_for_display(mode, cached.get("season_id"))
                 return cached
 
             data = await self._fetch_full_cn_leaderboard(mode)
+            if include_history:
+                await self._ensure_history_archive_for_display(mode, data.get("season_id"))
             self.cache[mode] = data
             return data
 
     async def _fetch_full_cn_leaderboard(self, mode: str) -> dict:
-        season_id = await self._get_current_season_id()
+        season_id = await self._get_current_season_id(mode)
+        data = await self._fetch_full_cn_leaderboard_for_season(mode, season_id)
+        self._record_history(
+            mode,
+            data.get("official_rows", []),
+            season_id=data.get("season_id"),
+            total=data.get("total"),
+        )
+        return data
 
+    async def _fetch_full_cn_leaderboard_for_season(self, mode: str, season_id: int) -> dict:
         first = await self._fetch_cn_page(mode, season_id, 1)
         root = first.get("data") or {}
         first_rows = root.get("list") or []
@@ -1510,8 +2119,6 @@ class Main(Star):
             if str(row["rank"]).isdigit()
             else 999999
         )
-
-        self._record_history(mode, official_rows)
 
         official_update = self._extract_update_time(first)
         rows = self._merge_fake_rows(mode, official_rows)
@@ -1601,6 +2208,54 @@ class Main(Star):
             "%Y-%m-%d %H:%M"
         )
 
+    def _score_delta_suffix(self, mode: str, row: dict, season_id: int | str | None = None) -> str:
+        if row.get("fake"):
+            return ""
+
+        name = str(row.get("name", "")).strip()
+        if not name:
+            return ""
+
+        try:
+            current_rank = int(row.get("rank"))
+            current_score = int(row.get("score"))
+        except Exception:
+            return ""
+
+        records = self._find_history_records(mode, name, season_id)
+        if not records:
+            return ""
+
+        latest_date, latest = records[-1]
+        baseline = None
+
+        try:
+            latest_matches_current = (
+                int(latest.get("rank")) == current_rank
+                and int(latest.get("score")) == current_score
+            )
+        except Exception:
+            latest_matches_current = False
+
+        if latest_matches_current:
+            if len(records) < 2:
+                return ""
+            baseline = records[-2]
+        else:
+            baseline = (latest_date, latest)
+
+        baseline_date, baseline_item = baseline
+        try:
+            score_delta = current_score - int(baseline_item.get("score"))
+        except Exception:
+            return ""
+
+        score_text = f"+{score_delta}" if score_delta > 0 else str(score_delta)
+        if score_delta == 0:
+            score_text = "±0"
+
+        return f"（较{baseline_date} {score_text}）"
+
     def _format_rows(
         self,
         mode: str,
@@ -1609,6 +2264,8 @@ class Main(Star):
         title_suffix: str,
         total_count: int,
         limit: int,
+        page: int = 1,
+        next_command: str | None = None,
     ) -> str:
         update_time = data.get("official_update")
         if data.get("fake_only"):
@@ -1628,25 +2285,36 @@ class Main(Star):
             f"（{time_label}{shown_time}{season_part}）："
         ]
 
-        if not rows:
+        page = max(1, page)
+        start_index = (page - 1) * limit
+        page_rows = rows[start_index:start_index + limit]
+
+        if not page_rows:
             lines.append("没有找到匹配结果。")
+            if total_count > 0 and page > 1:
+                lines.append(f"共命中 {total_count} 条，但第 {page} 页已经没有结果。")
             if not update_time and not data.get("fake_only"):
                 lines.append("注：接口未返回官方榜单更新时间，以上为本次数据获取时间。")
             return "\n".join(lines)
 
-        for row in rows[:limit]:
+        for row in page_rows:
             if row.get("fake"):
                 note = row.get("note") or self.DEFAULT_FAKE_NOTE
                 lines.append(f"排名:{str(row['rank']).ljust(8)}（手动添加） 昵称:{row['name']}（{note}）")
                 lines.append(f"积分:{row['score']}（手动添加）")
             else:
-                lines.append(f"排名:{str(row['rank']).ljust(8)} 昵称:{row['name']}")
-                lines.append(f"积分:{row['score']}")
+                score_delta = self._score_delta_suffix(mode, row, data.get("season_id"))
+                history_suffix = self._history_season_suffix(mode, row, data.get("season_id"))
+                lines.append(f"排名:{str(row['rank']).ljust(8)} 昵称:{row['name']}{history_suffix}")
+                lines.append(f"积分:{row['score']}{score_delta}")
 
-        if total_count > limit:
-            lines.append(f"……共命中 {total_count} 条，仅显示前 {limit} 条。")
+        shown_until = start_index + len(page_rows)
+        if total_count > shown_until:
+            lines.append(f"……共命中 {total_count} 条，当前第 {page} 页，每页 {limit} 条。")
+            if next_command:
+                lines.append(f"下一页：{next_command}")
 
-        fake_count = len([row for row in rows[:limit] if row.get("fake")])
+        fake_count = len([row for row in page_rows if row.get("fake")])
         if fake_count:
             lines.append("注：带“手动添加”的记录不是官方排行榜，是群友自己装逼写上去的。")
 
@@ -1663,11 +2331,15 @@ class Main(Star):
             "战棋榜 某人                    按昵称关键词查询；命中双打/单打哪个就显示哪个\n"
             "战棋榜 id 某人                 精确查询昵称；命中后显示所在排名区间\n"
             "战棋榜 查 关键词               模糊查询昵称关键词\n"
+            "战棋榜 查 关键词 10 2          每页10条，查看第2页\n"
             "战棋榜 涨跌 某人               查询某人在双打和单打中的排名涨跌\n"
+            "战棋榜 历史                    查看历史快照/赛季归档；缺历史时会自动补\n"
+            "战棋榜 历史 某人               展开某人的全部历史赛季排名\n"
             "\n"
             "当前排行榜：\n"
             "战棋榜 双打排行                显示双打前20名\n"
-            "战棋榜 双打排行 50             显示双打前50名\n"
+            "战棋榜 双打排行 50             每页50条，显示第1页\n"
+            "战棋榜 双打排行 50 2           每页50条，显示第2页\n"
             "战棋榜 单打排行                显示单打前20名\n"
             "战棋榜 单打排行 50             显示单打前50名\n"
             "\n"
@@ -1686,6 +2358,9 @@ class Main(Star):
             "战棋榜 id bg 某人              只精确查询单打昵称\n"
             "战棋榜 涨跌 duo 某人           只查某人的双打涨跌\n"
             "战棋榜 涨跌 bg 某人            只查某人的单打涨跌\n"
+            "战棋榜 历史 duo                只查看双打历史快照日期\n"
+            "战棋榜 历史 bg                 只查看单打历史快照日期\n"
+            "战棋榜 历史 duo 某人           只展开某人的双打历史赛季排名\n"
             "\n"
             "数据更新：\n"
             "战棋榜 更新                    手动刷新并记录双打+单打榜单\n"
